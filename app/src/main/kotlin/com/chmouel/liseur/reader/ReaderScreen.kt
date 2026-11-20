@@ -1344,11 +1344,10 @@ internal fun ReaderScreen(
         // leaving at least 1000ms of the 5000ms gate for the fallback
         // navigation to be issued while the gate is still closed.
         return withTimeoutOrNull(budgetMs) {
-            repeat(OpeningRestoration.EXACT_OPEN_VERIFY_ATTEMPTS) {
+            do {
                 settleLayout()
-                if (verifyOpeningTarget(nav, locator)) return@withTimeoutOrNull true
-            }
-            false
+            } while (!verifyOpeningTarget(nav, locator))
+            true
         } == true
     }
 

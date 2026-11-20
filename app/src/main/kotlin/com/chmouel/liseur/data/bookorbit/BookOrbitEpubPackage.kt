@@ -3,8 +3,10 @@ package com.chmouel.liseur.data.bookorbit
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.StringReader
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
+import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
 import java.util.zip.ZipFile
 import javax.xml.XMLConstants
@@ -15,6 +17,7 @@ import org.jsoup.nodes.DocumentType
 import org.jsoup.parser.Parser
 import org.w3c.dom.Element
 import org.w3c.dom.NodeList
+import org.xml.sax.InputSource
 import org.xml.sax.SAXException
 import org.xml.sax.helpers.DefaultHandler
 
@@ -64,7 +67,7 @@ data class BookOrbitEpubPackage(
             val item = publication.spine.singleOrNull { it.href == href } ?: return null
             val manifest = publication.manifest[item.idref] ?: return null
             if (manifest.mediaType != "application/xhtml+xml") return null
-            return ZipFile(epub).use { zip -> xml(read(zip, href)) }
+            return ZipFile(epub).use { zip -> parseSpineXhtml(read(zip, href)) }
         }
 
         private fun read(zip: ZipFile, name: String): ByteArray {
@@ -141,6 +144,291 @@ data class BookOrbitEpubPackage(
         }
 
         /**
+         * Parses a spine XHTML document without external I/O.
+         *
+         * EPUB 2 chapters declare the external XHTML 1.1 DOCTYPE and use HTML
+         * named entities (`&nbsp;`, `&mdash;`). External entities resolve to
+         * an empty stream, internal DTD subsets and `file:` system IDs are
+         * rejected, and HTML named entities (except XML's five built-in markup
+         * entities) are decoded beforehand so DOM text offsets match Foliate
+         * and WebView.
+         */
+        internal fun parseSpineXhtml(bytes: ByteArray): org.w3c.dom.Document {
+            if (bytes.size > MAX_XML_BYTES) throw ParseException("EPUB XML is too large")
+            val decoded = prepareSpineXhtml(decodeXmlBytes(bytes))
+            try {
+                val factory = newSafeDocumentBuilderFactory()
+                val builder = factory.newDocumentBuilder().apply {
+                    setEntityResolver { _, systemId ->
+                        if (systemId?.trim()?.startsWith("file:", ignoreCase = true) == true) {
+                            throw SAXException("external file entity")
+                        }
+                        InputSource(StringReader(""))
+                    }
+                    setErrorHandler(object : DefaultHandler() {
+                        override fun fatalError(error: org.xml.sax.SAXParseException): Nothing = throw error
+                    })
+                }
+                return builder.parse(InputSource(StringReader(decoded))).also {
+                    it.doctype?.let { type ->
+                        if (!type.internalSubset.isNullOrEmpty() ||
+                            !type.name.equals("html", ignoreCase = true) ||
+                            type.systemId?.trim()?.startsWith("file:", ignoreCase = true) == true
+                        ) {
+                            throw ParseException("EPUB XML document type must not contain declarations")
+                        }
+                    }
+                }
+            } catch (error: SAXException) {
+                throw ParseException("EPUB XML is not well-formed: ${error.message}")
+            } catch (error: ParserConfigurationException) {
+                throw ParseException("EPUB XML parser is unavailable: ${error.message}")
+            }
+        }
+
+        /**
+         * Validates `<!DOCTYPE html ...>` and decodes HTML named entities in
+         * one pass over [raw], keeping `<?...?>`, `<!--...-->`, and
+         * `<![CDATA[...]]>` distinct and rejecting DTD declarations
+         * (`<!ENTITY`, `<!ELEMENT`, `<!ATTLIST`, `<!NOTATION`), internal
+         * subsets, and `file:` system IDs.
+         */
+        private fun prepareSpineXhtml(raw: String): String {
+            val out = StringBuilder(raw.length)
+            var i = 0
+            while (i < raw.length) {
+                val ch = raw[i]
+                if (ch == '<') {
+                    when {
+                        raw.startsWith("<!--", i) -> {
+                            val end = raw.indexOf("-->", i + 4)
+                            if (end < 0) throw ParseException("EPUB XML has an unterminated comment")
+                            out.append(raw, i, end + 3)
+                            i = end + 3
+                        }
+                        raw.startsWith("<![CDATA[", i) -> {
+                            val end = raw.indexOf("]]>", i + 9)
+                            if (end < 0) throw ParseException("EPUB XML has an unterminated CDATA section")
+                            out.append(raw, i, end + 3)
+                            i = end + 3
+                        }
+                        raw.startsWith("<?", i) -> {
+                            val end = raw.indexOf("?>", i + 2)
+                            if (end < 0) throw ParseException("EPUB XML has an unterminated processing instruction")
+                            out.append(raw, i, end + 2)
+                            i = end + 2
+                        }
+                        raw.startsWith("<!", i) -> {
+                            val end = consumeXhtmlDoctype(raw, i)
+                            out.append(raw, i, end)
+                            i = end
+                        }
+                        else -> {
+                            out.append('<')
+                            i++
+                            var quote = '\u0000'
+                            while (i < raw.length) {
+                                val tagChar = raw[i]
+                                if (quote == '\u0000') {
+                                    if (tagChar == '"' || tagChar == '\'') {
+                                        quote = tagChar
+                                        out.append(tagChar)
+                                        i++
+                                    } else if (tagChar == '>') {
+                                        out.append('>')
+                                        i++
+                                        break
+                                    } else {
+                                        out.append(tagChar)
+                                        i++
+                                    }
+                                } else {
+                                    if (tagChar == quote) {
+                                        quote = '\u0000'
+                                        out.append(tagChar)
+                                        i++
+                                    } else if (tagChar == '&') {
+                                        i = appendEntityOrAmpersand(raw, i, out)
+                                    } else {
+                                        out.append(tagChar)
+                                        i++
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if (ch == '&') {
+                    i = appendEntityOrAmpersand(raw, i, out)
+                } else {
+                    out.append(ch)
+                    i++
+                }
+            }
+            return out.toString()
+        }
+
+        private fun consumeXhtmlDoctype(raw: String, start: Int): Int {
+            if (!raw.regionMatches(start, "<!DOCTYPE", 0, 9, ignoreCase = true)) {
+                throw ParseException("EPUB XML document type must not contain declarations")
+            }
+            var at = start + 9
+            at = skipXmlSpaces(raw, at, required = true)
+            val nameStart = at
+            while (at < raw.length && !isXmlSpace(raw[at]) && raw[at] !in ">[<'\"") at++
+            if (!raw.substring(nameStart, at).equals("html", ignoreCase = true)) {
+                throw ParseException("EPUB XHTML document type must name html")
+            }
+            at = skipXmlSpaces(raw, at, required = false)
+            if (raw.getOrNull(at) == '>') return at + 1
+            if (at == nameStart + 4 && !isXmlSpace(raw.getOrNull(start + 9 + (at - start - 9) - 1) ?: 'x')) {
+                throw ParseException("EPUB XHTML document type is invalid")
+            }
+            val keywordStart = at
+            while (at < raw.length && raw[at].isLetter()) at++
+            val keyword = raw.substring(keywordStart, at).uppercase()
+            at = skipXmlSpaces(raw, at, required = true)
+            when (keyword) {
+                "PUBLIC" -> {
+                    val (_, afterPub) = readDoctypeLiteral(raw, at)
+                    at = skipXmlSpaces(raw, afterPub, required = false)
+                    if (raw.getOrNull(at) != '>') {
+                        if (!isXmlSpace(raw[afterPub])) {
+                            throw ParseException("EPUB XHTML document type is invalid")
+                        }
+                        val (sysId, afterSys) = readDoctypeLiteral(raw, at)
+                        if (sysId.trim().startsWith("file:", ignoreCase = true)) {
+                            throw ParseException("EPUB XHTML document type is not allowed")
+                        }
+                        at = skipXmlSpaces(raw, afterSys, required = false)
+                    }
+                }
+                "SYSTEM" -> {
+                    val (sysId, afterSys) = readDoctypeLiteral(raw, at)
+                    if (sysId.trim().startsWith("file:", ignoreCase = true)) {
+                        throw ParseException("EPUB XHTML document type is not allowed")
+                    }
+                    at = skipXmlSpaces(raw, afterSys, required = false)
+                }
+                else -> throw ParseException("EPUB XHTML document type is invalid or contains declarations")
+            }
+            if (raw.getOrNull(at) != '>') {
+                throw ParseException("EPUB XHTML document type is invalid or contains declarations")
+            }
+            return at + 1
+        }
+
+        private fun readDoctypeLiteral(raw: String, start: Int): Pair<String, Int> {
+            val quote = raw.getOrNull(start)?.takeIf { it == '"' || it == '\'' }
+                ?: throw ParseException("EPUB XHTML document type literal is missing quotes")
+            var at = start + 1
+            while (at < raw.length && raw[at] != quote) {
+                if (raw[at] in "<>[]") {
+                    throw ParseException("EPUB XHTML document type is invalid or contains declarations")
+                }
+                at++
+            }
+            if (at >= raw.length) throw ParseException("EPUB XHTML document type has an unterminated literal")
+            return raw.substring(start + 1, at) to (at + 1)
+        }
+
+        private fun skipXmlSpaces(raw: String, start: Int, required: Boolean): Int {
+            var at = start
+            while (at < raw.length && isXmlSpace(raw[at])) at++
+            if (required && at == start) throw ParseException("EPUB XHTML document type is invalid")
+            return at
+        }
+
+        private fun isXmlSpace(ch: Char): Boolean =
+            ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n'
+
+        private fun appendEntityOrAmpersand(raw: String, start: Int, out: StringBuilder): Int {
+            val limit = minOf(raw.length, start + 36)
+            var at = start + 1
+            if (at < limit && raw[at].isAsciiLetter()) {
+                at++
+                while (at < limit && (raw[at].isAsciiLetter() || raw[at].isDigit())) at++
+                if (at < limit && raw[at] == ';') {
+                    val name = raw.substring(start + 1, at)
+                    if (name !in XML_BUILTINS) {
+                        val reference = raw.substring(start, at + 1)
+                        val unescaped = Parser.unescapeEntities(reference, true)
+                        if (unescaped != reference && unescaped.isNotEmpty() &&
+                            unescaped.none { it in "<>&\"'" }
+                        ) {
+                            out.append(unescaped)
+                            return at + 1
+                        }
+                    }
+                }
+            }
+            out.append('&')
+            return start + 1
+        }
+
+        private fun Char.isAsciiLetter(): Boolean =
+            this in 'a'..'z' || this in 'A'..'Z'
+
+        private fun decodeXmlBytes(bytes: ByteArray): String {
+            val (charset, offset) = when {
+                bytes.size >= 3 &&
+                    bytes[0] == 0xEF.toByte() &&
+                    bytes[1] == 0xBB.toByte() &&
+                    bytes[2] == 0xBF.toByte() -> Charsets.UTF_8 to 3
+                bytes.size >= 2 &&
+                    bytes[0] == 0xFE.toByte() &&
+                    bytes[1] == 0xFF.toByte() -> Charsets.UTF_16BE to 2
+                bytes.size >= 2 &&
+                    bytes[0] == 0xFF.toByte() &&
+                    bytes[1] == 0xFE.toByte() -> Charsets.UTF_16LE to 2
+                bytes.size >= 4 &&
+                    bytes[0] == 0.toByte() && bytes[1] != 0.toByte() &&
+                    bytes[2] == 0.toByte() && bytes[3] != 0.toByte() ->
+                    Charsets.UTF_16BE to 0
+                bytes.size >= 4 &&
+                    bytes[0] != 0.toByte() && bytes[1] == 0.toByte() &&
+                    bytes[2] != 0.toByte() && bytes[3] == 0.toByte() ->
+                    Charsets.UTF_16LE to 0
+                else -> declaredXmlCharset(bytes) to 0
+            }
+            return try {
+                charset.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes, offset, bytes.size - offset))
+                    .toString()
+            } catch (_: CharacterCodingException) {
+                throw ParseException("EPUB XML is not valid ${charset.name()}")
+            }
+        }
+
+        private fun declaredXmlCharset(bytes: ByteArray): Charset {
+            val head = String(bytes, 0, bytes.size.coerceAtMost(256), Charsets.ISO_8859_1)
+            if (!head.startsWith("<?xml") || head.getOrNull(5)?.let(::isXmlSpace) != true) {
+                return Charsets.UTF_8
+            }
+            val end = head.indexOf("?>")
+            if (end < 0) return Charsets.UTF_8
+            val encoding = XML_ENCODING.find(head.substring(0, end))?.groupValues?.get(2)
+                ?: return Charsets.UTF_8
+            return try {
+                Charset.forName(encoding)
+            } catch (_: IllegalArgumentException) {
+                throw ParseException("Unsupported XML encoding $encoding")
+            }
+        }
+
+        private fun newSafeDocumentBuilderFactory(): DocumentBuilderFactory =
+            DocumentBuilderFactory.newInstance().apply {
+                isNamespaceAware = true
+                bestEffort("http://xml.org/sax/features/external-general-entities", false)
+                bestEffort("http://xml.org/sax/features/external-parameter-entities", false)
+                bestEffort("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
+                bestEffort(XMLConstants.FEATURE_SECURE_PROCESSING, true)
+                runCatching { isXIncludeAware = false }
+                isExpandEntityReferences = false
+            }
+
+        /**
          * Jsoup safely identifies declarations before strict DOM parsing.
          * Android does not support every DocumentBuilderFactory feature,
          * so these switches are best effort; the preflight allows only bare
@@ -156,15 +444,7 @@ data class BookOrbitEpubPackage(
                 throw ParseException("EPUB XML document type must not contain identifiers or declarations")
             }
             try {
-                val factory = DocumentBuilderFactory.newInstance().apply {
-                    isNamespaceAware = true
-                    bestEffort("http://xml.org/sax/features/external-general-entities", false)
-                    bestEffort("http://xml.org/sax/features/external-parameter-entities", false)
-                    bestEffort("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
-                    bestEffort(XMLConstants.FEATURE_SECURE_PROCESSING, true)
-                    runCatching { isXIncludeAware = false }
-                    isExpandEntityReferences = false
-                }
+                val factory = newSafeDocumentBuilderFactory()
                 val builder = factory.newDocumentBuilder().apply {
                     setEntityResolver { _, _ -> throw SAXException("external XML entity") }
                     setErrorHandler(object : DefaultHandler() {
@@ -271,6 +551,8 @@ data class BookOrbitEpubPackage(
 
         private const val HEX = "0123456789abcdefABCDEF"
         private val BARE_DOCTYPE = Regex("<!DOCTYPE[ \\t\\r\\n]+[^\\s\\[<>]+[ \\t\\r\\n]*>")
+        private val XML_BUILTINS = setOf("lt", "gt", "amp", "quot", "apos")
+        private val XML_ENCODING = Regex("""encoding[\s]*=[\s]*(['"])([^'"]+)\1""", RegexOption.IGNORE_CASE)
         private val SCHEME = Regex("^[A-Za-z][A-Za-z0-9+.-]*:")
         private const val CONTAINER_PATH = "META-INF/container.xml"
         private const val OCF_NAMESPACE = "urn:oasis:names:tc:opendocument:xmlns:container"

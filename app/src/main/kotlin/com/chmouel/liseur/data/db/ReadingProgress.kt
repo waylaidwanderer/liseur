@@ -181,6 +181,17 @@ data class ReadingProgress(
                 elapsedMs = readingPaceElapsedMs,
                 evidence = readingPaceEvidence,
             )
+
+    /** True when this row records a reading place, not just a status choice. */
+    val hasSavedPlace: Boolean
+        get() = hasSavedPlace(locatorJson, totalProgression)
+
+    companion object {
+        const val EMPTY_LOCATOR = "{}"
+
+        fun hasSavedPlace(locatorJson: String?, totalProgression: Double?): Boolean =
+            (locatorJson != null && locatorJson != EMPTY_LOCATOR) || totalProgression != null
+    }
 }
 
 /** When a book was last read, on this device or another one. */

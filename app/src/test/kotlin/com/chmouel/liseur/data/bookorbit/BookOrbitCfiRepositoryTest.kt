@@ -1429,6 +1429,16 @@ class BookOrbitCfiRepositoryTest {
     }
 
     @Test
+    fun `status change on an unopened book creates no local place`(): Unit = runBlocking {
+        val context = repository.capture(binding.bookUrl)
+        db.readingProgressDao().setFinishedOverride(context.bookUrl, 2, "Unread", null, 10)
+        server.enqueue(MockResponse(body = saved("epubcfi(/6/4!/4/2:3)", 50.0)))
+        assertNull(agreement().previewConflict(context))
+        server.takeRequest()
+        assertFalse(agreement().approximateOffer(context, progress(percentageOnly(50.0)))!!.replacesLocalPlace)
+    }
+
+    @Test
     fun `explicit take-remote choice uses supplied offer only after closing`(): Unit = runBlocking {
         val context = repository.capture(binding.bookUrl)
         val first = "epubcfi(/6/4!/4/2:3)"
@@ -2523,6 +2533,58 @@ class BookOrbitCfiRepositoryTest {
         for (status in statuses) {
             assertEquals(status, BookOrbitBooks.parseStatus(JSONObject("""{"status":"$status"}"""))?.status)
         }
+    }
+
+    @Test
+    fun `local place without verified cfi adopts remote place and refuses keep-local`(): Unit = runBlocking {
+        val context = repository.capture(binding.bookUrl)
+        val localLocator = """{"href":"OPS/front.xhtml","type":"application/xhtml+xml","locations":{"totalProgression":0.1}}"""
+        db.readingProgressDao().recordLocal(
+            bookUrl = context.bookUrl,
+            locatorJson = localLocator,
+            progression = 0.1,
+            readingSecondsPerPosition = null,
+            readingPaceSamples = null,
+            readingPaceElapsedMs = null,
+            readingPaceEvidence = null,
+            status = "Reading",
+            updatedAt = 10L,
+        )
+        val remoteCfi = "epubcfi(/6/4!/4/2:9)"
+        server.enqueue(MockResponse(body = saved(remoteCfi, 25.0)))
+        val preview = checkNotNull(agreement().previewConflict(context))
+        server.takeRequest()
+        assertNull(preview.localCfi)
+        assertFalse(preview.canKeepLocal)
+
+        server.enqueue(MockResponse(body = saved(remoteCfi, 25.0)))
+        assertThrows(BookOrbitPositionUnresolved::class.java) {
+            runBlocking { exchange().keepLocal(preview) }
+        }
+        assertEquals("GET", server.takeRequest().method)
+        assertEquals(2, server.requestCount)
+
+        val offer = BookOrbitPullOffer(
+            context, preview.remote, preview.localRevision, preview.localLocator,
+            """{"href":"OPS/one.xhtml","type":"application/xhtml+xml","locations":{"totalProgression":0.25}}""",
+            "OPS/one.xhtml",
+        )
+        db.readingProgressDao().openBooks.enter(context.bookUrl)
+        try {
+            server.enqueue(MockResponse(body = saved(remoteCfi, 25.0)))
+            assertTrue(agreement().adoptChosenVerifiedInReader(preview, offer))
+            assertEquals("GET", server.takeRequest().method)
+        } finally {
+            db.readingProgressDao().openBooks.leave(context.bookUrl)
+        }
+        val adopted = db.readingProgressDao().get(context.bookUrl)!!
+        assertEquals(offer.locatorJson, adopted.locatorJson)
+        assertEquals(remoteCfi, agreement().state(context).agreedRemoteCfi)
+        assertEquals(remoteCfi, db.bookOrbitLocalCfiDao().get(context.request.accountKey, context.bookUrl)!!.rawCfi)
+
+        server.enqueue(MockResponse(body = saved(remoteCfi, 25.0)))
+        assertEquals(BookOrbitPositionExchange.Result.Agreed, exchange().run(context.bookUrl))
+        assertEquals("GET", server.takeRequest().method)
     }
 
     private fun fixture(name: String): String =

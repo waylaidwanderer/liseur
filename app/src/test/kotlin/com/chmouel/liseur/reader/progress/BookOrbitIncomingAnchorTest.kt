@@ -21,7 +21,9 @@ class BookOrbitIncomingAnchorTest {
     @Test
     fun `incoming cold open never overrides a saved local position`() {
         assertTrue(BookOrbitIncomingAnchor.mayOfferOnOpen(null, null))
+        assertTrue(BookOrbitIncomingAnchor.mayOfferOnOpen("{}", null))
         assertFalse(BookOrbitIncomingAnchor.mayOfferOnOpen("saved locator", null))
+        assertFalse(BookOrbitIncomingAnchor.mayOfferOnOpen("{}", 0.0))
         assertFalse(BookOrbitIncomingAnchor.mayOfferOnOpen(null, 0.0))
     }
 
@@ -163,5 +165,68 @@ class BookOrbitIncomingAnchorTest {
             publication,
             xml,
         ))
+    }
+
+    @Test
+    fun `element cfi resolves to the following visible text`() {
+        fun parse(body: String) = DocumentBuilderFactory.newInstance().apply {
+            isNamespaceAware = true
+        }.newDocumentBuilder().parse(InputSource(StringReader(
+            """<html xmlns="http://www.w3.org/1999/xhtml"><head/><body>$body</body></html>""",
+        )))
+
+        val doc = parse(
+            """<a id="mark"/>
+               <div>
+                 <svg xmlns="http://www.w3.org/2000/svg"><title>Ignored</title></svg>
+                 <p id="first">Open<i>ing</i> sentence.</p>
+                 <p id="second">Next paragraph.</p>
+               </div>""",
+        )
+        val fromMark = BookOrbitIncomingAnchor.resolve(
+            "epubcfi(/6[reading-order]/2[ref-one]!/4/2[mark])",
+            publication,
+            doc,
+        )!!
+        assertEquals("body > div:nth-of-type(1) > p:nth-of-type(1)", fromMark.anchor.cssSelector)
+        assertEquals("Opening", fromMark.anchor.highlight)
+        assertEquals(" sentence.", fromMark.anchor.after)
+
+        val afterFirst = BookOrbitIncomingAnchor.resolve(
+            "epubcfi(/6[reading-order]/2[ref-one]!/4/4/4[first;s=a])",
+            publication,
+            doc,
+        )!!
+        assertEquals("body > div:nth-of-type(1) > p:nth-of-type(2)", afterFirst.anchor.cssSelector)
+        assertEquals("Next", afterFirst.anchor.highlight)
+
+        val textless = parse("""<div><svg xmlns="http://www.w3.org/2000/svg"><title>Ignored</title></svg></div>""")
+        assertNull(BookOrbitIncomingAnchor.resolve(
+            "epubcfi(/6[reading-order]/2[ref-one]!/4/2/2)",
+            publication,
+            textless,
+        ))
+    }
+
+    @Test
+    fun `tokens longer than 64 code points slice contiguously around the offset`() {
+        val longToken = "一".repeat(20) + "😀" + (1..60).joinToString("") { "章%02d".format(it) }
+        val doc = DocumentBuilderFactory.newInstance().apply {
+            isNamespaceAware = true
+        }.newDocumentBuilder().parse(InputSource(StringReader(
+            """<html xmlns="http://www.w3.org/1999/xhtml">
+                 <head/>
+                 <body><p id="cjk">$longToken</p></body>
+               </html>""",
+        )))
+        // Offset 21 falls on the low surrogate of 😀 (indices 20..21).
+        val target = BookOrbitIncomingAnchor.resolve(
+            "epubcfi(/6[reading-order]/2[ref-one]!/4/2[cjk]/1:21)",
+            publication,
+            doc,
+        )!!
+        val quote = target.anchor.before + target.anchor.highlight + target.anchor.after
+        assertTrue(longToken.contains(quote))
+        assertTrue(target.anchor.highlight.startsWith("😀章01"))
     }
 }
